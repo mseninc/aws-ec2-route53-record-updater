@@ -1,0 +1,229 @@
+service: aws-ec2-route53-record-updater
+frameworkVersion: "3"
+
+plugins:
+  - serverless-step-functions
+  # - serverless-plugin-typescript
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  logRetentionInDays: 30
+  stage: dev
+  region: us-east-1
+  timeout: 10
+
+  stackTags:
+    SERVICE: ${self:service}
+    APP: ${self:service}
+    STAGE: ${sls:stage}
+
+  iam:
+    role:
+      statements:
+        # - Effect: "Allow" # Systems Manager - Parameter Store
+        #   Action:
+        #     - "ssm:GetParameter"
+        #   Resource:
+        #     - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.********}
+        - Effect: "Allow" # KMS - Decrypt (for encrypted SSM parameters)
+          Action:
+            - "kms:Decrypt"
+          Resource:
+            - arn:aws:kms:ap-northeast-1:851725479915:key/16889861-08ea-4db8-beed-374d635ae972
+
+package:
+  individually: true
+  patterns:
+    - "!**"
+
+params:
+  default:
+    domainNameTagKey: Route53Record
+    route53HostedZoneId: ${env:ROUTE53_HOSTED_ZONE_ID}
+    stateMachineName: ${self:service}-task
+
+##################################################
+# Step Functions ステートマシン定義
+##################################################
+
+stepFunctions:
+  stateMachines:
+    TaskStateMachine:
+      name: ${param:stateMachineName}
+      loggingConfig:
+        level: ERROR
+        includeExecutionData: true
+        destinations:
+          - !GetAtt MyTaskLogGroup.Arn
+      role: !GetAtt MyStateMachineIAMRole.Arn
+      definition:
+        StartAt: DescribeInstances
+        States:
+          DescribeInstances:
+            Type: Task
+            Parameters:
+              InstanceIds.$: States.Array($.detail['instance-id'])
+            Resource: arn:aws:states:::aws-sdk:ec2:describeInstances
+            Next: CheckRoute53RecordTag
+            ResultSelector:
+              Instance.$: States.ArrayGetItem($.Reservations[*].Instances[*], 0)
+          CheckRoute53RecordTag:
+            Type: Pass
+            Next: IfRoute53RecordSpecified
+            Parameters:
+              Array.$: $.Instance.Tags[?(@.Key==${param:domainNameTagKey})].Value
+              ArrayLength.$: States.ArrayLength($.Instance.Tags[?(@.Key==${param:domainNameTagKey})].Value)
+            ResultPath: $.CheckRoute53RecordTag
+          IfRoute53RecordSpecified:
+            Type: Choice
+            Choices:
+              - Variable: $.CheckRoute53RecordTag.ArrayLength
+                NumericGreaterThan: 0
+                Next: ExtractRoute53RecordValue
+            Default: Success
+          ExtractRoute53RecordValue:
+            Type: Pass
+            Next: ChangeRoute53Record
+            Parameters:
+              Route53Record.$: States.ArrayGetItem($.CheckRoute53RecordTag.Array, 0)
+              IpAddress.$: $.Instance.PublicIpAddress
+          Success:
+            Type: Succeed
+          ChangeRoute53Record:
+            Type: Task
+            Parameters:
+              ChangeBatch:
+                Changes:
+                  - Action: UPSERT
+                    ResourceRecordSet:
+                      Name.$: $.Route53Record
+                      Type: A
+                      Ttl: 60
+                      ResourceRecords:
+                        - Value.$: $.IpAddress
+              HostedZoneId: ${param:route53HostedZoneId}
+            Resource: arn:aws:states:::aws-sdk:route53:changeResourceRecordSets
+            Next: Success
+
+##################################################
+# リソース定義
+##################################################
+
+resources:
+  Resources:
+    MyTaskLogGroup:
+      Type: "AWS::Logs::LogGroup"
+      Properties:
+        LogGroupName: /aws/states/${param:stateMachineName}
+        RetentionInDays: 60
+
+    # StepFunctions 用の IAM ロール
+    MyStateMachineIAMRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        Path: "/${self:service}/"
+        RoleName: ${self:service}-stateMachine-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - "states.amazonaws.com"
+              Action: "sts:AssumeRole"
+        Policies:
+          - PolicyName: ${self:service}-stateMachine-policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                # 補足: "The state machine IAM Role is not authorized to access the Log Destination"
+                # が表示されるときは cloudwatch-logs-resource-policy.md を参照
+                - Effect: Allow # CloudWatch Logs
+                  Action:
+                    - logs:CreateLogDelivery
+                    - logs:GetLogDelivery
+                    - logs:UpdateLogDelivery
+                    - logs:DeleteLogDelivery
+                    - logs:ListLogDeliveries
+                    - logs:PutResourcePolicy
+                    - logs:DescribeResourcePolicies
+                    - logs:DescribeLogGroup
+                  Resource: "*"
+                - Effect: Allow # Lambda
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}*
+                - Effect: "Allow" # StepFunctions
+                  Action:
+                    - "states:StartExecution"
+                  Resource:
+                    - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${self:service}*"
+                - Effect: Allow # EventBridge
+                  Action:
+                    - events:PutTargets
+                    - events:PutRule
+                    - events:DescribeRule
+                  Resource:
+                    - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule
+                - Effect: Allow # EC2
+                  Action:
+                    - ec2:DescribeInstances
+                  Resource: "*"
+                - Effect: Allow # Route53
+                  Action:
+                    - route53:ChangeResourceRecordSets
+                  Resource:
+                    - !Sub arn:aws:route53:::hostedzone/${param:route53HostedZoneId}
+                - Effect: Allow # X-Ray
+                  Action:
+                    - xray:PutTraceSegments
+                    - xray:PutTelemetryRecords
+                    - xray:GetSamplingRules
+                    - xray:GetSamplingTargets
+                  Resource: "*"
+
+    # StepFunctions を呼び出す EventBridge ルール用の IAM ロール
+    MyEventBridgeEventRuleRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        Path: "/${self:service}/"
+        RoleName: ${self:service}-event-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - "events.amazonaws.com"
+              Action: "sts:AssumeRole"
+        Policies:
+          - PolicyName: ${self:service}-invocation-policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow # StepFunctions
+                  Action:
+                    - states:StartExecution
+                  Resource:
+                    - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${param:stateMachineName}
+
+    MyEventRuleOnEC2Running:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: default
+        EventPattern:
+          source:
+            - aws.ec2
+          detail-type:
+            - EC2 Instance State-change Notification
+          detail:
+            state:
+              - running
+        Name: UpdateRoute53RecordOnEC2Running
+        State: ENABLED
+        Targets:
+          - Id: Invoke_${param:stateMachineName}
+            Arn: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${param:stateMachineName}
+            RoleArn: !GetAtt MyEventBridgeEventRuleRole.Arn

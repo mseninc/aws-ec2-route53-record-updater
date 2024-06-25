@@ -1,0 +1,19 @@
+{
+  "name": "aws-ec2-route53-record-updater",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "prettier": "^3.3.2",
+    "serverless": "^3.39.0",
+    "serverless-plugin-typescript": "^2.1.5",
+    "serverless-step-functions": "^3.21.0",
+    "typescript": "^5.5.2"
+  }
+}
